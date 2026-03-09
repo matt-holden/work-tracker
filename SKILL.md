@@ -34,7 +34,6 @@ All data lives in `~/.config/work-log/`. Create this directory and any missing f
    conversations in different tabs may be writing to the same file.
 4. **Projects are the unit of identity, not repos.** The same project can span multiple repos and tickets.
    Unrelated work in the same repo is tracked as separate projects.
-5. **ACLI integration is optional.** Everything works without it. ACLI just enriches data.
 
 ## Conversation Start Procedure
 
@@ -46,17 +45,8 @@ Run this at the beginning of every conversation. Keep it fast and silent.
 mkdir -p ~/.config/work-log/archive
 ```
 
-If `wip.md` doesn't exist, create it with:
-
-```markdown
-# Work In Progress
-```
-
-If the current year's work log doesn't exist, create it with:
-
-```markdown
-# YYYY Work Log
-```
+If `wip.md` doesn't exist, create it with `# Work In Progress`.
+If the current year's work log doesn't exist, create it with `# YYYY Work Log`.
 
 ### Step 2: Read Current State
 
@@ -71,28 +61,19 @@ git rev-parse --git-common-dir 2>/dev/null    # detects worktree
 basename "$(git rev-parse --show-toplevel)"   # repo name
 ```
 
-If in a worktree, also capture the worktree path:
-
-```bash
-pwd    # worktree working directory
-```
-
+If in a worktree, also capture `pwd` for the worktree working directory.
 If not in a git repo, skip to Step 5.
 
 ### Step 4: Match to WIP Item
 
 Compare the detected repo + branch against existing entries in `wip.md`.
 
-**Match found:** Resume tracking silently. Output:
-```
-[work-tracker] Tracking: <Project Name> (<Ticket>)
-```
+**Match found:** Resume tracking silently.
 
 **New branch in a known repo:** Ask briefly:
 ```
 [work-tracker] New branch `feature/new-api` in `backend`. Is this part of an existing project or something new?
 ```
-
 Wait for the user's answer. Then create or update the WIP item accordingly.
 
 **Unknown repo entirely:** Ask briefly:
@@ -124,53 +105,22 @@ Or if no match was made and no question needed:
 [work-tracker] Ready | X items in progress
 ```
 
-That's it. Move on to whatever the user actually wants to do.
-
 ## Session Opt-Out
 
-The user can disable tracking for the current conversation at any time. This is purely
-in-memory, per-conversation state. It is never persisted to any file. Other conversations
-in other tabs are completely unaffected.
+The user can pause tracking for the current conversation at any time. This is purely in-memory,
+per-conversation state — never persisted to any file. Other tabs are unaffected.
 
-### Pausing
+**Pausing:** If the user expresses "stop/pause/skip tracking" in any natural phrasing, immediately
+stop all tracking for this conversation (no reads, no writes, no confirmations, completely invisible).
+Output: `[work-tracker] Tracking paused for this conversation.`
 
-If the user says anything like "don't track this," "pause work tracker," "skip tracking,"
-"no tracking for this conversation," "stop tracking," etc., immediately stop all tracking
-for this conversation:
+**Resuming:** If the user asks to resume, re-run the Conversation Start Procedure from Step 1.
+Output: `[work-tracker] Tracking resumed. Tracking: <Project> (<Ticket>) | X items in progress`
 
-- No further reads of `wip.md`
-- No writes to the work log
-- No one-liner confirmations
-- No context detection
-- Completely invisible
+**Edge case:** If the user pauses tracking but then asks "what's in progress?" — answer the status
+query directly, but do not resume automatic tracking unless they explicitly ask to resume.
 
-Output exactly:
-```
-[work-tracker] Tracking paused for this conversation.
-```
-
-Then go fully silent. Do not mention work-tracker again unless the user re-enables it.
-
-### Resuming
-
-If the user later says "resume tracking," "turn tracking back on," "start tracking again,"
-etc., re-run the Conversation Start Procedure from Step 1 and resume normal behavior.
-
-Output:
-```
-[work-tracker] Tracking resumed. Tracking: <Project> (<Ticket>) | X items in progress
-```
-
-### Rules
-
-- Opt-out is **never written** to `wip.md`, `config.md`, or any file. It exists only in
-  the current conversation's memory.
-- Closing the tab or starting a new session always starts fresh with tracking enabled.
-- The user does not need to use exact phrasing. Any natural language expressing "stop tracking
-  for now" should be understood.
-- If the user pauses tracking and then asks "what's in progress?" -- that's a direct request
-  for WIP status, so answer it. But do not resume automatic tracking unless they explicitly
-  ask to resume.
+Closing the tab or starting a new session always starts fresh with tracking enabled.
 
 ## Logging During a Conversation
 
@@ -192,22 +142,16 @@ Write to the work log and update `wip.md` immediately after any of these events:
 1. Re-read `~/.config/work-log/wip.md` (fresh, no cache)
 2. Re-read `~/.config/work-log/YYYY-work-log.md` to find today's section
 
-**Update `wip.md`:**
-- Update the `Status` field with a brief description of where things stand now
-- Update `Last touched` to today's date
-- If the branch or worktree changed, update those fields
+**Update `wip.md`:** Update `Status`, `Last touched`, and any changed fields (branch, worktree).
 
 **Append to `YYYY-work-log.md`:**
 - Find or create today's date section (`## YYYY-MM-DD`)
 - Find or create the project subsection (`### Project Name (Ticket)`)
 - Append a brief bullet describing what was done
 
-**Output:**
-```
-[work-tracker] Updated: <Project Name> (<Ticket>)
-```
+The work log is append-only. Never modify past entries retroactively.
 
-One line. Nothing more.
+Output: `[work-tracker] Updated: <Project Name> (<Ticket>)`
 
 ### Log Entry Format
 
@@ -244,12 +188,12 @@ In `wip.md`:
 ```
 
 Field rules:
-- `Worktree` line: only include if the work is in a worktree. Omit for regular branches.
-- `Branch` line: only include for git-tracked items. Omit for non-code work.
-- `Repo` line: only include for git-tracked items.
-- `MR` line: only include when a merge request or pull request exists. Use `!number` for GitLab MRs, `#number` for GitHub PRs. Capture this when a PR/MR is created.
-- `Status`: always brief -- one or two sentences describing where things stand.
-- For non-code work, add a `Type` field instead of Repo/Branch:
+- `Worktree`: only include if the work is in a worktree.
+- `Branch`, `Repo`: only include for git-tracked items.
+- `MR`: only when a merge request or pull request exists. Use `!number` for GitLab MRs, `#number` for GitHub PRs.
+- `Status`: always brief — one or two sentences.
+
+For non-code work, use a `Type` field instead of Repo/Branch:
 
 ```markdown
 ## <no ticket> | Q2 Architecture Presentation
@@ -261,11 +205,11 @@ Field rules:
 
 ## On-Demand Commands
 
-Respond to these when the user asks. These are natural language -- the user won't use exact phrasing.
+Respond to these when the user asks. These are natural language — the user won't use exact phrasing.
 
 ### "What's in progress?" / "Show my WIP" / "Status?"
 
-Read `wip.md` and display all active items in this format:
+Read `wip.md` and display all active items:
 
 ```
 ## Work In Progress
@@ -275,25 +219,18 @@ XYZ-1234 | Auth Service Rewrite
   Worktree: ~/projects/.worktrees/oauth2-migration
   Status: Migrated token refresh logic. Integration tests still pending.
 
-XYZ-1301 | API Rate Limiting
-  Branch: feature/rate-limits
-  Status: Initial middleware scaffolding done. Need to add Redis backend.
-
 <no ticket> | Q2 Architecture Presentation
   Type: Non-code
   Status: Outline complete, working on diagrams.
 ```
 
-Rules:
-- Show the Worktree line only if the item has a worktree path.
-- Show the Branch line only for git-tracked items.
-- Status is always the brief summary from `wip.md`.
+Only show Worktree/Branch lines when the item has them. For items untouched 30+ days,
+append: `(Last touched N days ago — run cleanup to check remote status)`
 
 ### "This is done" / "Mark X as finished" / "I finished X"
 
 1. Identify which WIP item is being finished. If ambiguous, ask.
-2. Ask: "Is the whole project done, or just this ticket/task?" -- because finishing one ticket
-   doesn't necessarily mean the project is complete if other tickets are still open.
+2. Ask: "Is the whole project done, or just this ticket/task?"
 3. If just a ticket: update the WIP item to remove that ticket, keep the project active.
 4. If the whole project: write a final summary entry to the work log with a `[COMPLETED]` tag,
    then remove the item from `wip.md`.
@@ -322,20 +259,6 @@ Output: `[work-tracker] New item: <Project Name> (<Ticket or "no ticket">)`
 Log it as part of an existing project if the user indicates a relationship, or as a standalone
 non-code entry otherwise. If ACLI is configured and the user provides a page ID, fetch the page
 title to enrich the entry (see `references/acli-integration.md`).
-
-Example log entry:
-
-```markdown
-### Auth Service Rewrite (XYZ-1234)
-- Updated architecture runbook on Confluence
-```
-
-Or standalone:
-
-```markdown
-### Onboarding Documentation (Confluence)
-- Rewrote the new hire setup guide
-```
 
 Output: `[work-tracker] Logged: <description>`
 
@@ -369,17 +292,9 @@ Led migration from legacy session-based auth to OAuth2/OIDC.
 Implemented token refresh, session management, and integration test suite.
 Reduced auth-related incidents by enabling token rotation.
 
-### API Platform v2 (May - Aug YYYY)
-Related tickets: XYZ-1301, XYZ-1315
-Repos: mycompany/backend
-
-Designed and built rate limiting middleware with Redis backend.
-Introduced tiered API access for external partners.
-
 ## Other Contributions
 - Q2 Architecture Presentation (Mar YYYY)
 - Onboarding documentation updates (Jun YYYY)
-- Incident response: production DB failover (Jul YYYY)
 
 ## Summary Statistics
 - X projects completed
@@ -387,7 +302,7 @@ Introduced tiered API access for external partners.
 - Spanning Z JIRA tickets
 ```
 
-Keep the narrative brief and impact-focused. This is for a performance review -- emphasize
+Keep the narrative brief and impact-focused. This is for a performance review — emphasize
 outcomes over implementation details.
 
 ### "Clean up WIP" / "Cleanup" / "Prune stale items"
@@ -402,22 +317,17 @@ closed, or abandoned outside of a tracked conversation.
    - If the item has a `Worktree` field, use that path.
    - Otherwise, if you're currently in the item's repo, use the current directory.
    - Otherwise, skip the item (can't reach its remote from here).
-3. Check if the branch still exists on the remote:
+3. Run `git fetch origin` once per repo, then check if the branch exists on the remote:
    ```bash
    git ls-remote --heads origin <branch>
    ```
-   Empty output means the branch is gone.
 4. If the item has an `MR` field, also check MR/PR state:
-   - GitLab (`!number`): `glab mr view <number>` — look at the `state:` line
-   - GitHub (`#number`): `gh pr view <number>` — look at the state
+   - GitLab (`!number`): `glab mr view <number>`
+   - GitHub (`#number`): `gh pr view <number>`
    - If the CLI tool isn't available or the command fails, skip this check silently.
-5. Classify the item:
-   - **Merged**: branch gone from remote, or MR state is `merged`
-   - **Closed**: MR state is `closed` (branch may or may not exist)
-   - **Active**: branch exists on remote and MR is still open (or no MR)
-   - **Unknown**: couldn't reach remote — skip silently
-6. Skip non-git items (no `Branch` field). Mention them at the end: "N non-git items skipped (can't auto-check)."
-7. Present findings **one item at a time**. For each stale item, show:
+5. Classify: **Merged** (branch gone or MR merged), **Closed** (MR closed), **Active** (branch exists, MR open or none), **Unknown** (couldn't reach remote — skip silently).
+6. Skip non-git items. Mention at the end: "N non-git items skipped (can't auto-check)."
+7. Present findings **one item at a time**:
    ```
    <ticket> | <Project Name>
      Branch: <branch> — not found on remote
@@ -426,30 +336,20 @@ closed, or abandoned outside of a tracked conversation.
    ```
    Wait for the user's answer before proceeding to the next item.
 8. For confirmed removals: write a `[COMPLETED]` entry to the work log, remove from `wip.md`.
-9. For items the user wants to keep: leave them in `wip.md` unchanged.
-
-**Output when done:**
-```
-[work-tracker] Cleanup: removed N items, M remain
-```
+   For items the user wants to keep: leave unchanged.
 
 **Rules:**
 - Never auto-remove without asking. Every removal requires explicit confirmation.
-- If all items are active, output: `[work-tracker] Cleanup: all N items still active`
-- Run `git fetch origin` once per repo before checking, to ensure remote refs are current.
+- If all items are active: `[work-tracker] Cleanup: all N items still active`
+- When done: `[work-tracker] Cleanup: removed N items, M remain`
 
 ## Project Grouping
 
-Projects are identified by name. The name is established when the user first answers
-"what project is this?" and persists in `wip.md` and `config.md`.
+Projects are identified by name, established when the user first answers "what project is this?"
+and persisted in `wip.md` and `config.md`.
 
-### How Grouping Works
-
-1. User tells you: "That's the API Platform v2 project." The skill uses "API Platform v2" as the
-   project name for all future matching.
-2. Multiple tickets accumulate under the same project name across conversations.
-3. Multiple repos can map to the same project.
-4. `config.md` stores persistent aliases:
+- Multiple tickets and repos can map to the same project.
+- `config.md` stores persistent aliases (create the file when the first alias is established):
 
 ```markdown
 ## Project Aliases
@@ -457,103 +357,28 @@ Projects are identified by name. The name is established when the user first ans
 # XYZ-1301, XYZ-1315, backend/feature/api-*    ->  API Platform v2
 ```
 
-5. When ACLI is available, the skill can also look up the parent epic to suggest groupings
-   (see `references/acli-integration.md`).
-
-### Updating config.md
-
-When a new ticket or branch is associated with a project (through the user's answer or ACLI
-epic lookup), add it to the project aliases section in `config.md`. This makes future matching
-automatic -- the skill won't need to ask again for known mappings.
+- When a new ticket or branch is associated with a project, add it to config.md for automatic
+  future matching.
+- When ACLI is available, look up the parent epic to suggest groupings
+  (see `references/acli-integration.md`).
 
 ## Edge Cases
 
 ### Branch Switching Without New Conversation
 
-If the user switches branches mid-conversation (e.g., `git checkout other-branch`), the skill
-won't automatically detect this since it checks git context at conversation start. If the user
-mentions they switched branches, or if a git command reveals a different branch than expected,
-re-run the matching logic and update tracking accordingly.
+If the user switches branches mid-conversation, the skill won't automatically detect this.
+If the user mentions it or a git command reveals a different branch, re-run the matching logic.
 
 ### Multiple Worktrees, Same Project
 
-A project may have multiple worktrees for different sub-tasks. Track them all under the same
-WIP item. The `wip.md` entry should reflect the most recently active worktree.
-
-### Stale WIP Items
-
-If a WIP item hasn't been touched in a long time (30+ days), don't proactively nag about it.
-Only mention staleness if the user asks for WIP status -- then note:
-```
-XYZ-1234 | Auth Service Rewrite
-  Branch: feature/oauth2-migration
-  Status: Migrated token refresh logic. Integration tests still pending.
-  (Last touched 45 days ago — run cleanup to check remote status)
-```
-
-To detect and remove items whose branches have been merged or deleted, use the **cleanup**
-on-demand command (see "Clean up WIP" under On-Demand Commands).
-
-### No Config File
-
-If `config.md` doesn't exist, the skill works fine. Project grouping relies on the user's
-answers stored in `wip.md`. Create `config.md` when the first alias mapping is established.
-
-### ACLI Not Installed or Not Authenticated
-
-If ACLI commands fail, silently fall back to manual mode. Never error out or nag about ACLI.
-The skill is fully functional without it.
+Track them all under the same WIP item. The entry should reflect the most recently active worktree.
 
 ## ACLI Integration (Optional)
 
 **IMPORTANT:** Before running any ACLI commands, read `references/acli-integration.md` for the
-correct command syntax. Do not guess command structures -- the reference file has the exact
-invocations needed.
+correct command syntax. Do not guess command structures.
 
-For JIRA and Confluence enrichment via the Atlassian CLI, see `references/acli-integration.md`.
-
-This is entirely optional. The skill works without ACLI. When ACLI is available and configured,
-it provides:
+ACLI is entirely optional — if commands fail, silently fall back to manual mode. When available:
 - Auto-populated ticket titles and status from JIRA
 - Parent epic lookup for automatic project grouping
 - Confluence page title lookup by page ID
-
-## Quick Reference
-
-### One-liner outputs:
-
-| Event | Output |
-|---|---|
-| Conversation start, match found | `[work-tracker] Tracking: Project (Ticket) \| X items in progress` |
-| Conversation start, no match | `[work-tracker] Ready \| X items in progress` |
-| After logging work | `[work-tracker] Updated: Project (Ticket)` |
-| New item created | `[work-tracker] New item: Project (Ticket)` |
-| Item completed | `[work-tracker] Completed: Project (Ticket)` |
-| Confluence/non-code logged | `[work-tracker] Logged: description` |
-| Cleanup completed | `[work-tracker] Cleanup: removed N items, M remain` |
-| Cleanup, nothing stale | `[work-tracker] Cleanup: all N items still active` |
-
-### File write checklist:
-
-Every time you write to `wip.md` or `YYYY-work-log.md`:
-1. Re-read the file fresh (do not use cached content)
-2. Make the update
-3. Write the file
-4. Output the one-liner confirmation
-
-### Never:
-
-- Wait for conversation end to log work
-- Output more than one line of confirmation for routine updates
-- Nag about ACLI not being installed
-- Proactively ask what the user is working on when there's no git context
-- Create WIP items without the user's knowledge (except when auto-matching a known mapping)
-- Modify the work log retroactively (it's append-only)
-
-### Always:
-
-- Read `wip.md` fresh before every write
-- Log immediately after meaningful actions
-- Ask before creating a new project ("Is this part of X or something new?")
-- Ask "whole project done or just this ticket?" when marking things finished
-- Keep status descriptions brief (1-2 sentences max)
