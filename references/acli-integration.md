@@ -78,6 +78,65 @@ XYZ-1234 | Auth Service Rewrite
   JIRA Status: Done (ticket was closed -- mark as finished?)
 ```
 
+### Transitioning Ticket Status
+
+**Critical:** ACLI transition requires an exact status name match. There is no `list` subcommand
+to discover valid names — `acli jira workitem transition list` errors requiring `--status`, making
+it a dead end. Status names are project-specific and cannot be guessed reliably.
+
+**Always check the known status map below before probing.** If the target project is listed, use
+the exact name from the table. If not listed, use the probe pattern below to discover valid names
+and then add them to this document.
+
+#### Known Status Maps
+
+| Project | Workflow (in order) |
+|---------|---------------------|
+| XP | To Do → In Progress → Code Review → Ready for Testing → In Testing → Done |
+
+#### Transition Command
+
+```bash
+acli jira workitem transition --key XP-5210 --status "Ready for Testing" --yes 2>&1
+```
+
+- Use `--yes` to skip confirmation prompt.
+- On success: `✓ Work item KEY-123 has been successfully transitioned to <Status>`
+- On failure: `✗ Failure: KEY-123 can't be transitioned: No allowed transitions found for given status`
+
+**Important:** You can only transition to a status that is directly reachable from the current
+status. If the ticket is in "In Progress" and you want "Ready for Testing", you may need to
+step through intermediate states (e.g., In Progress → Code Review → Ready for Testing).
+Always fetch the current status first before attempting a transition.
+
+#### Discovering Valid Status Names (when project is not in the table above)
+
+Run transitions against a sequence of candidate names and observe which succeed. Run them
+**one at a time and check the resulting status after each** — do not loop over candidates
+unattended, as the loop will overshoot through multiple states before you can stop it.
+
+```bash
+# Check current status first
+acli jira workitem view KEY-123 --fields status --json
+
+# Then try one candidate at a time
+acli jira workitem transition --key KEY-123 --status "Ready for Testing" --yes 2>&1
+```
+
+If you accidentally overshoot, transition back using the prior known-good status name.
+Once you find the working names, **add them to the Known Status Maps table above**.
+
+### Assigning a Ticket
+
+```bash
+acli jira workitem assign --key KEY-123 --assignee "user@example.com" --yes 2>&1
+```
+
+- Accepts email address or account ID.
+- Use `--assignee "@me"` to self-assign.
+- Use `--yes` to skip confirmation prompt.
+- On success: `✓ Work item KEY-123 has been successfully assigned to user@example.com`
+
 ## Confluence Commands
 
 ### Fetch Page Title by ID

@@ -17,7 +17,7 @@ All data lives in `~/.config/work-log/`. Create this directory and any missing f
 ```
 ~/.config/work-log/
   wip.md                     # Active work items dashboard
-  config.md                  # Project aliases, ACLI settings (optional)
+  config.md                  # Project aliases, GitLab settings (optional)
   2025-work-log.md           # Calendar year logs (one per year)
   2026-work-log.md
   archive/
@@ -129,7 +129,10 @@ Closing the tab or starting a new session always starts fresh with tracking enab
 Write to the work log and update `wip.md` immediately after any of these events:
 
 - A git commit is made
-- A PR/MR is created or merged (capture the MR/PR number into the `MR` field of the WIP item)
+- A PR/MR is created or merged — capture the full MR/PR URL into the `MR` field of the WIP item.
+  When `gh pr create` or `glab mr create` is run, the URL is printed in the output; capture it directly.
+  If the MR was created outside this conversation and only a number is known, construct the URL from
+  the repo's remote origin (e.g., `git remote get-url origin`) and the MR/PR number.
 - A meaningful code change is completed (file edits, refactors)
 - A test suite or build is run
 - The user describes work they've done (Confluence edits, presentations, etc.)
@@ -181,7 +184,7 @@ In `wip.md`:
 - **Repo:** mycompany/auth-service
 - **Branch:** feature/oauth2-migration
 - **Worktree:** ~/projects/.worktrees/oauth2-migration
-- **MR:** !1234
+- **MR:** https://gitlab.com/mycompany/auth-service/-/merge_requests/1234
 - **Status:** Migrated token refresh logic. Integration tests still pending.
 - **Started:** 2026-02-15
 - **Last touched:** 2026-03-07
@@ -190,7 +193,7 @@ In `wip.md`:
 Field rules:
 - `Worktree`: only include if the work is in a worktree.
 - `Branch`, `Repo`: only include for git-tracked items.
-- `MR`: only when a merge request or pull request exists. Use `!number` for GitLab MRs, `#number` for GitHub PRs.
+- `MR`: only when a merge request or pull request exists. Store the full URL so it is clickable in the terminal. For GitHub PRs this is the `https://github.com/...` URL; for GitLab MRs this is the `https://gitlab.com/...` URL. If the full URL cannot be determined, fall back to `!number` (GitLab) or `#number` (GitHub).
 - `Status`: always brief — one or two sentences.
 
 For non-code work, use a `Type` field instead of Repo/Branch:
@@ -217,6 +220,7 @@ Read `wip.md` and display all active items:
 XYZ-1234 | Auth Service Rewrite
   Branch: feature/oauth2-migration
   Worktree: ~/projects/.worktrees/oauth2-migration
+  MR: https://gitlab.com/mycompany/auth-service/-/merge_requests/1234
   Status: Migrated token refresh logic. Integration tests still pending.
 
 <no ticket> | Q2 Architecture Presentation
@@ -224,8 +228,35 @@ XYZ-1234 | Auth Service Rewrite
   Status: Outline complete, working on diagrams.
 ```
 
-Only show Worktree/Branch lines when the item has them. For items untouched 30+ days,
+Only show Worktree/Branch/MR lines when the item has them. For items untouched 30+ days,
 append: `(Last touched N days ago — run cleanup to check remote status)`
+
+**Pending Reviews:** After displaying WIP items, check for MRs assigned to the user for review.
+
+1. Read `config.md` for the `gitlab-group` setting under `## GitLab Settings`.
+2. If `gitlab-group` is configured, run:
+   ```bash
+   glab mr list --reviewer=@me --group="<gitlab-group>" --output=json 2>/dev/null
+   ```
+3. If the command succeeds and returns results, display them after the WIP items:
+
+```
+## Pending Reviews
+
+- Fix token refresh for OAuth2 flow
+  https://gitlab.com/heb-engineering/projects/native-apps/ios/auth-service/-/merge_requests/456
+  Opened 2 days ago
+
+- Add unit tests for session manager
+  https://gitlab.com/heb-engineering/projects/native-apps/ios/core-lib/-/merge_requests/789
+  Opened 4 hours ago
+```
+
+4. Compute the "Opened X ago" value from the `created_at` field in the JSON response, relative to now.
+   Use the most natural unit: minutes (< 1 hour), hours (< 1 day), or days.
+5. If no MRs are pending review, output: `No pending reviews.`
+6. If `gitlab-group` is not configured, or `glab` is not available, or the command fails — skip
+   the Pending Reviews section silently. Do not warn or error.
 
 ### "This is done" / "Mark X as finished" / "I finished X"
 
@@ -322,8 +353,9 @@ closed, or abandoned outside of a tracked conversation.
    git ls-remote --heads origin <branch>
    ```
 4. If the item has an `MR` field, also check MR/PR state:
-   - GitLab (`!number`): `glab mr view <number>`
-   - GitHub (`#number`): `gh pr view <number>`
+   - If the MR field is a full URL, extract the MR/PR number from the URL path.
+   - GitLab (URL contains `merge_requests` or field starts with `!`): `glab mr view <number>`
+   - GitHub (URL contains `pull` or field starts with `#`): `gh pr view <number>`
    - If the CLI tool isn't available or the command fails, skip this check silently.
 5. Classify: **Merged** (branch gone or MR merged), **Closed** (MR closed), **Active** (branch exists, MR open or none), **Unknown** (couldn't reach remote — skip silently).
 6. Skip non-git items. Mention at the end: "N non-git items skipped (can't auto-check)."
@@ -331,7 +363,7 @@ closed, or abandoned outside of a tracked conversation.
    ```
    <ticket> | <Project Name>
      Branch: <branch> — not found on remote
-     MR: !1234 — merged
+     MR: https://gitlab.com/mycompany/repo/-/merge_requests/1234 — merged
      Remove from WIP and log as completed? (y/n)
    ```
    Wait for the user's answer before proceeding to the next item.
@@ -349,9 +381,12 @@ Projects are identified by name, established when the user first answers "what p
 and persisted in `wip.md` and `config.md`.
 
 - Multiple tickets and repos can map to the same project.
-- `config.md` stores persistent aliases (create the file when the first alias is established):
+- `config.md` stores persistent aliases and settings (create the file when the first alias is established):
 
 ```markdown
+## GitLab Settings
+gitlab-group: heb-engineering/projects/native-apps/ios
+
 ## Project Aliases
 # XYZ-1234, XYZ-1235, XYZ-1240, auth-service/*  ->  Auth Service Rewrite
 # XYZ-1301, XYZ-1315, backend/feature/api-*    ->  API Platform v2
