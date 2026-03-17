@@ -10,201 +10,133 @@ for annual performance reviews.
 
 **Announce at start:** A single quiet line. Nothing more.
 
-## Directory Structure
+## CLI Tool
 
-All data lives in `~/.config/work-log/`. Create this directory and any missing files on first run.
+The `wt` command handles all file I/O, git detection, markdown parsing, and data manipulation.
+Location: `~/.agents/skills/work-tracker/scripts/wt`
+
+The LLM never reads or writes work-tracker data files directly. Always use `wt`.
+
+## Data Directory
+
+All data lives in `~/.config/work-log/`:
 
 ```
-~/.config/work-log/
-  wip.md                     # Active work items dashboard
-  config.md                  # Project aliases, GitLab settings (optional)
-  2025-work-log.md           # Calendar year logs (one per year)
-  2026-work-log.md
-  archive/
-    2025-annual-summary.md   # Past year executive summaries
+wip.md                     # Active work items dashboard
+config.md                  # Project aliases, GitLab settings (optional)
+YYYY-work-log.md           # Calendar year logs (one per year)
+archive/YYYY-annual-summary.md  # Past year executive summaries
 ```
 
 ## Core Principles
 
-1. **Log eagerly, not lazily.** Write to disk immediately after each meaningful action. Never wait for
+1. **Log eagerly, not lazily.** Call `wt log` immediately after each meaningful action. Never wait for
    "conversation end." Conversations may stay open for weeks across multiple terminal tabs.
-2. **Be quiet.** Output a single one-liner confirmation after each update. No narration, no chatter,
-   no "I'm now reading your WIP file."
-3. **Re-read before every write.** Always read `wip.md` fresh before updating it. Multiple concurrent
-   conversations in different tabs may be writing to the same file.
-4. **Projects are the unit of identity, not repos.** The same project can span multiple repos and tickets.
-   Unrelated work in the same repo is tracked as separate projects.
+2. **Be quiet.** Output a single one-liner confirmation after each update. No narration, no chatter.
+3. **Projects are the unit of identity, not repos.** The same project can span multiple repos and tickets.
 
 ## Conversation Start Procedure
 
-Run this at the beginning of every conversation. Keep it fast and silent.
-
-### Step 1: Ensure Data Directory Exists
+Run at the beginning of every conversation. Keep it fast and silent.
 
 ```bash
-mkdir -p ~/.config/work-log/archive
+~/.agents/skills/work-tracker/scripts/wt init && ~/.agents/skills/work-tracker/scripts/wt context
 ```
 
-If `wip.md` doesn't exist, create it with `# Work In Progress`.
-If the current year's work log doesn't exist, create it with `# YYYY Work Log`.
+The `init` output confirms data directory state. The `context` output is JSON:
 
-### Step 2: Read Current State
+```json
+{
+  "in_git_repo": true,
+  "repo": "group/repo-name",
+  "branch": "feature/XYZ-1234-thing",
+  "is_worktree": false,
+  "worktree_path": null,
+  "ticket": "XYZ-1234",
+  "match": { "found": true, "item_id": "XYZ-1234", "project": "...", "status": "..." },
+  "total_items": 4
+}
+```
 
-Read `~/.config/work-log/wip.md` to know what's currently in flight.
+**Interpret the result:**
 
-### Step 3: Detect Git Context
+- **`match.found == true`**: Resume tracking silently.
+  Output: `[work-tracker] Tracking: <project> (<ticket or "no ticket">) | N items in progress`
+
+- **`match.found == false`, `known_repo == true`**: New branch in a known repo. Ask briefly:
+  `[work-tracker] New branch '<branch>' in '<repo>'. Is this part of an existing project or something new?`
+  Wait for user's answer. Then run `wt add` or `wt update` accordingly.
+
+- **`match.found == false`, `known_repo == false`**: Unknown repo. Ask briefly:
+  `[work-tracker] First time seeing repo '<repo>'. What project is this for?`
+
+- **`in_git_repo == false`**: No git context. Do NOT ask what they're working on. Output:
+  `[work-tracker] Ready | N items in progress`
+
+**Ticket enrichment:** If `context.ticket` is non-null and ACLI is configured, fetch the ticket title
+and parent epic (see `references/acli-integration.md`). Use the ticket title as the project name if
+no existing project matches.
+
+**MR discovery:** After context detection, run:
 
 ```bash
-git rev-parse --show-toplevel 2>/dev/null     # repo root
-git rev-parse --abbrev-ref HEAD 2>/dev/null   # branch name
-git rev-parse --git-common-dir 2>/dev/null    # detects worktree
-basename "$(git rev-parse --show-toplevel)"   # repo name
+~/.agents/skills/work-tracker/scripts/wt discover
 ```
 
-If in a worktree, also capture `pwd` for the worktree working directory.
-If not in a git repo, skip to Step 5.
+If `untracked` is non-empty, present each untracked MR briefly and ask if it should be added:
 
-### Step 4: Match to WIP Item
-
-Compare the detected repo + branch against existing entries in `wip.md`.
-
-**Match found:** Resume tracking silently.
-
-**New branch in a known repo:** Ask briefly:
 ```
-[work-tracker] New branch `feature/new-api` in `backend`. Is this part of an existing project or something new?
-```
-Wait for the user's answer. Then create or update the WIP item accordingly.
-
-**Unknown repo entirely:** Ask briefly:
-```
-[work-tracker] First time seeing repo `new-service`. What project is this for?
+[work-tracker] Found 2 untracked MRs you authored:
+  1. "Fix OAuth token refresh" (!456, opened 3 days ago) — branch: fix/oauth-refresh
+  2. "Update CI pipeline" (!789, merged 2 days ago) — branch: ci-update
+Add any of these to WIP? (numbers, all, or skip)
 ```
 
-**Ticket number extraction:** If the branch name contains a ticket pattern (e.g., `feature/XYZ-1234-description`),
-extract the ticket number. If ACLI is configured, fetch the ticket title and parent epic
-(see `references/acli-integration.md`). If not, just record the ticket number and ask the user
-for a project name if one isn't already mapped in `config.md`.
-
-### Step 5: No Git Context
-
-If not in a git repo:
-- Check `wip.md` for non-git items.
-- Do NOT ask the user what they're working on unprompted. Wait for them to mention it or ask for status.
-- If the user mentions a task ("I'm preparing the Q2 presentation"), create a WIP item for it.
-
-### Step 6: Output
-
-One line, always:
-```
-[work-tracker] Tracking: <Project Name> (<Ticket or "no ticket">) | X items in progress
-```
-
-Or if no match was made and no question needed:
-```
-[work-tracker] Ready | X items in progress
-```
+For confirmed items, run `wt add` with the MR metadata (title as project name, branch, repo, MR URL).
+If the user says "skip" or similar, move on silently.
+If discover returns an empty list or fails, skip silently — do not mention it.
 
 ## Session Opt-Out
 
-The user can pause tracking for the current conversation at any time. This is purely in-memory,
-per-conversation state — never persisted to any file. Other tabs are unaffected.
+Purely in-memory, per-conversation state — never persisted. Other tabs are unaffected.
 
-**Pausing:** If the user expresses "stop/pause/skip tracking" in any natural phrasing, immediately
-stop all tracking for this conversation (no reads, no writes, no confirmations, completely invisible).
-Output: `[work-tracker] Tracking paused for this conversation.`
+**Pausing:** If the user says "stop/pause/skip tracking" in any phrasing, stop all tracking for this
+conversation. Output: `[work-tracker] Tracking paused for this conversation.`
 
-**Resuming:** If the user asks to resume, re-run the Conversation Start Procedure from Step 1.
-Output: `[work-tracker] Tracking resumed. Tracking: <Project> (<Ticket>) | X items in progress`
+**Resuming:** Re-run the Conversation Start Procedure.
+Output: `[work-tracker] Tracking resumed. Tracking: <Project> (<Ticket>) | N items in progress`
 
-**Edge case:** If the user pauses tracking but then asks "what's in progress?" — answer the status
-query directly, but do not resume automatic tracking unless they explicitly ask to resume.
+**Edge case:** If paused but user asks "what's in progress?" — run `wt status` and answer, but do
+not resume automatic tracking unless they explicitly ask.
 
-Closing the tab or starting a new session always starts fresh with tracking enabled.
+## When to Log
 
-## Logging During a Conversation
-
-### When to Log
-
-Write to the work log and update `wip.md` immediately after any of these events:
+Call `wt log` and optionally `wt update` immediately after any of these:
 
 - A git commit is made
-- A PR/MR is created or merged — capture the full MR/PR URL into the `MR` field of the WIP item.
-  When `gh pr create` or `glab mr create` is run, the URL is printed in the output; capture it directly.
-  If the MR was created outside this conversation and only a number is known, construct the URL from
-  the repo's remote origin (e.g., `git remote get-url origin`) and the MR/PR number.
+- A PR/MR is created or merged — also capture the URL: `wt update <id> --mr "<url>"`
 - A meaningful code change is completed (file edits, refactors)
 - A test suite or build is run
 - The user describes work they've done (Confluence edits, presentations, etc.)
 - The user explicitly says "log this"
 
-### How to Log
+**How:**
 
-**Every time, before writing:**
+```bash
+wt log "<item-id>" "<brief description of what was done>"
+wt update "<item-id>" --status "<1-2 sentence current state>"
+```
 
-1. Re-read `~/.config/work-log/wip.md` (fresh, no cache)
-2. Re-read `~/.config/work-log/YYYY-work-log.md` to find today's section
+To capture an MR URL when `gh pr create` or `glab mr create` runs:
 
-**Update `wip.md`:** Update `Status`, `Last touched`, and any changed fields (branch, worktree).
+```bash
+wt update "<item-id>" --mr "<full URL from command output>"
+```
 
-**Append to `YYYY-work-log.md`:**
-- Find or create today's date section (`## YYYY-MM-DD`)
-- Find or create the project subsection (`### Project Name (Ticket)`)
-- Append a brief bullet describing what was done
-
-The work log is append-only. Never modify past entries retroactively.
+If MR was created outside this conversation and only a number is known, construct the URL from the
+repo's remote origin and the MR/PR number, then pass it to `wt update --mr`.
 
 Output: `[work-tracker] Updated: <Project Name> (<Ticket>)`
-
-### Log Entry Format
-
-In `YYYY-work-log.md`:
-
-```markdown
-## 2026-03-08
-
-### Auth Service Rewrite (XYZ-1234)
-- Repo: mycompany/auth-service, branch: feature/oauth2-migration
-- Implemented retry logic for token refresh
-- Fixed race condition in session invalidation
-
-### Q2 Architecture Presentation
-- Created sequence diagrams for the new auth flow
-```
-
-Keep entries brief. One line per meaningful action. Include the repo and branch on the first entry
-of each day for that project.
-
-## WIP Item Format
-
-In `wip.md`:
-
-```markdown
-## XYZ-1234 | Auth Service Rewrite
-- **Repo:** mycompany/auth-service
-- **Branch:** feature/oauth2-migration
-- **Worktree:** ~/projects/.worktrees/oauth2-migration
-- **MR:** https://gitlab.com/mycompany/auth-service/-/merge_requests/1234
-- **Status:** Migrated token refresh logic. Integration tests still pending.
-- **Started:** 2026-02-15
-- **Last touched:** 2026-03-07
-```
-
-Field rules:
-- `Worktree`: only include if the work is in a worktree.
-- `Branch`, `Repo`: only include for git-tracked items.
-- `MR`: only when a merge request or pull request exists. Store the full URL so it is clickable in the terminal. For GitHub PRs this is the `https://github.com/...` URL; for GitLab MRs this is the `https://gitlab.com/...` URL. If the full URL cannot be determined, fall back to `!number` (GitLab) or `#number` (GitHub).
-- `Status`: always brief — one or two sentences.
-
-For non-code work, use a `Type` field instead of Repo/Branch:
-
-```markdown
-## <no ticket> | Q2 Architecture Presentation
-- **Type:** Documentation
-- **Status:** Outline complete, working on diagrams.
-- **Started:** 2026-03-01
-- **Last touched:** 2026-03-08
-```
 
 ## On-Demand Commands
 
@@ -212,166 +144,151 @@ Respond to these when the user asks. These are natural language — the user won
 
 ### "What's in progress?" / "Show my WIP" / "Status?"
 
-Read `wip.md` and display all active items:
-
-```
-## Work In Progress
-
-XYZ-1234 | Auth Service Rewrite
-  Branch: feature/oauth2-migration
-  Worktree: ~/projects/.worktrees/oauth2-migration
-  MR: https://gitlab.com/mycompany/auth-service/-/merge_requests/1234
-  Status: Migrated token refresh logic. Integration tests still pending.
-
-<no ticket> | Q2 Architecture Presentation
-  Type: Non-code
-  Status: Outline complete, working on diagrams.
+```bash
+wt status --json
 ```
 
-Only show Worktree/Branch/MR lines when the item has them. For items untouched 30+ days,
-append: `(Last touched N days ago — run cleanup to check remote status)`
+**IMPORTANT: Status output has TWO mandatory parts. Always do both.**
 
-**Pending Reviews:** After displaying WIP items, check for MRs assigned to the user for review.
+**Part 1 — WIP list.** Render as **grouped blocks**, one per item. Do NOT use a markdown table —
+tables break URL detection in terminals when cells wrap across lines.
 
-1. Read `config.md` for the `gitlab-group` setting under `## GitLab Settings`.
-2. If `gitlab-group` is configured, run:
-   ```bash
-   glab mr list --reviewer=@me --group="<gitlab-group>" --output=json 2>/dev/null
-   ```
-3. If the command succeeds and returns results, display them after the WIP items:
+Format each item as:
+
+```
+### 1. Project Name (or Ticket · Project Name)
+- **Branch:** `branch-name` (+ worktree path if exists)
+- **MR:** [!number](url)  (or "None" if no MR)
+- **Status:** Brief 1-line summary
+```
+
+Rules:
+- **Project heading**: `### N. ` + ticket (if any) + project name, e.g. `### 1. XP-5919 · Hero Grid Banner`
+- **Branch**: Show as `` `branch-name` ``. If a worktree exists, append ` — worktree: path`.
+- **MR**: Render as a clickable markdown link `[!number](url)` on its own line so the terminal can detect the full URL. Use `None` if no MR exists.
+- **Status**: Brief 1-line summary of current state.
+
+**Part 2 — Pending reviews.** Always run immediately after the table:
+
+```bash
+wt reviews
+```
+
+If reviews are returned, display them after the WIP table under a `## Pending Reviews` heading
+as a bullet list with title, linked URL, and age. Example:
 
 ```
 ## Pending Reviews
 
-- Fix token refresh for OAuth2 flow
-  https://gitlab.com/heb-engineering/projects/native-apps/ios/auth-service/-/merge_requests/456
-  Opened 2 days ago
-
-- Add unit tests for session manager
-  https://gitlab.com/heb-engineering/projects/native-apps/ios/core-lib/-/merge_requests/789
-  Opened 4 hours ago
+- [Fix token refresh for OAuth2 flow](https://gitlab.com/.../merge_requests/456) — opened 2 days ago
 ```
 
-4. Compute the "Opened X ago" value from the `created_at` field in the JSON response, relative to now.
-   Use the most natural unit: minutes (< 1 hour), hours (< 1 day), or days.
-5. If no MRs are pending review, output: `No pending reviews.`
-6. If `gitlab-group` is not configured, or `glab` is not available, or the command fails — skip
-   the Pending Reviews section silently. Do not warn or error.
+If no reviews or the command returns an empty list, output: `No pending reviews.`
+If reviews fail silently (no glab, no config), skip the section entirely.
+
+**Never show Part 1 without Part 2.** They are always displayed together.
 
 ### "This is done" / "Mark X as finished" / "I finished X"
 
-1. Identify which WIP item is being finished. If ambiguous, ask.
+1. Identify which WIP item. If ambiguous, ask.
 2. Ask: "Is the whole project done, or just this ticket/task?"
-3. If just a ticket: update the WIP item to remove that ticket, keep the project active.
-4. If the whole project: write a final summary entry to the work log with a `[COMPLETED]` tag,
-   then remove the item from `wip.md`.
+3. If just a ticket: `wt update <id> --status "<updated status>"` to reflect the ticket is done.
+4. If the whole project:
+   ```bash
+   wt done "<item-id>" "<completion summary>"
+   ```
 5. Output: `[work-tracker] Completed: <Project Name> (<Ticket>)`
-
-Work log entry for completion:
-
-```markdown
-### Auth Service Rewrite (XYZ-1234) [COMPLETED]
-- Project completed. Migration from session-based auth to OAuth2/OIDC finished.
-- Final PR merged, integration tests passing.
-```
 
 ### "I'm working on X" / "track: X"
 
-Create a new WIP item. Ask clarifying questions only if needed:
-- "Does this have a JIRA ticket?"
-- "Is this related to an existing project?"
+Ask clarifying questions if needed ("Does this have a JIRA ticket?", "Is this related to an existing project?"), then:
 
-For non-git tasks, create a `Type: Non-code` entry.
+```bash
+wt add "<Project Name>" --ticket "<XYZ-1234>" --repo "<repo>" --branch "<branch>" [--worktree "<path>"] [--type "<Non-code>"]
+```
+
+For non-git tasks, use `--type` instead of `--repo`/`--branch`.
 
 Output: `[work-tracker] New item: <Project Name> (<Ticket or "no ticket">)`
 
-### "I updated X on Confluence" / Confluence-related work
+### Confluence-related work
 
-Log it as part of an existing project if the user indicates a relationship, or as a standalone
-non-code entry otherwise. If ACLI is configured and the user provides a page ID, fetch the page
-title to enrich the entry (see `references/acli-integration.md`).
+Log it as part of an existing project if related, or create a standalone non-code entry. If ACLI
+is configured and the user provides a page ID, fetch the page title (see `references/acli-integration.md`).
+
+```bash
+wt log "<item-id>" "Updated Confluence page: <title>"
+```
 
 Output: `[work-tracker] Logged: <description>`
 
 ### "Generate my annual summary" / "Generate summary for YYYY"
 
-1. Determine the year. Default to current calendar year. Accept an explicit year if provided.
-2. Read `YYYY-work-log.md` for the target year.
-3. Group entries by project (using the project name, not repo).
-4. For each project, produce an executive-style summary:
-   - Project name and date range (first entry to last entry)
-   - Related tickets (all ticket numbers seen)
-   - Repos involved
-   - 2-3 sentence narrative: what was done and why it mattered
-5. Add an "Other Contributions" section for smaller or non-code items.
-6. Add summary statistics (projects completed, repos active in, tickets worked).
-7. Write to `~/.config/work-log/archive/YYYY-annual-summary.md`.
-8. Also display the summary to the user in the conversation.
-
-Output format:
-
-```markdown
-# YYYY Annual Summary
-
-## Major Projects
-
-### Auth Service Rewrite (Feb - Apr YYYY)
-Related tickets: XYZ-1234, XYZ-1235, XYZ-1240
-Repos: mycompany/auth-service, mycompany/shared-libs
-
-Led migration from legacy session-based auth to OAuth2/OIDC.
-Implemented token refresh, session management, and integration test suite.
-Reduced auth-related incidents by enabling token rotation.
-
-## Other Contributions
-- Q2 Architecture Presentation (Mar YYYY)
-- Onboarding documentation updates (Jun YYYY)
-
-## Summary Statistics
-- X projects completed
-- Active across Y repositories
-- Spanning Z JIRA tickets
+```bash
+wt summary <year>
 ```
+
+This returns structured JSON with projects grouped, date ranges, ticket numbers, repos, and all
+entries. Use this data to write an executive-style narrative:
+
+- Project name and date range (first entry to last entry)
+- Related tickets
+- Repos involved
+- 2-3 sentence narrative: what was done and why it mattered
+- "Other Contributions" section for smaller or non-code items
+- Summary statistics (projects completed, repos active, tickets worked)
+
+Write to `~/.config/work-log/archive/YYYY-annual-summary.md` and display to the user.
 
 Keep the narrative brief and impact-focused. This is for a performance review — emphasize
 outcomes over implementation details.
 
 ### "Clean up WIP" / "Cleanup" / "Prune stale items"
 
-Checks all git-tracked WIP items against their remotes to find items that have been merged,
-closed, or abandoned outside of a tracked conversation.
+```bash
+wt cleanup
+```
 
-**Procedure:**
+### "Find my MRs" / "Discover" / "Am I missing anything?"
 
-1. Read `wip.md`.
-2. For each git-tracked item (has a `Branch` field), determine the repo directory:
-   - If the item has a `Worktree` field, use that path.
-   - Otherwise, if you're currently in the item's repo, use the current directory.
-   - Otherwise, skip the item (can't reach its remote from here).
-3. Run `git fetch origin` once per repo, then check if the branch exists on the remote:
-   ```bash
-   git ls-remote --heads origin <branch>
-   ```
-4. If the item has an `MR` field, also check MR/PR state:
-   - If the MR field is a full URL, extract the MR/PR number from the URL path.
-   - GitLab (URL contains `merge_requests` or field starts with `!`): `glab mr view <number>`
-   - GitHub (URL contains `pull` or field starts with `#`): `gh pr view <number>`
-   - If the CLI tool isn't available or the command fails, skip this check silently.
-5. Classify: **Merged** (branch gone or MR merged), **Closed** (MR closed), **Active** (branch exists, MR open or none), **Unknown** (couldn't reach remote — skip silently).
-6. Skip non-git items. Mention at the end: "N non-git items skipped (can't auto-check)."
-7. Present findings **one item at a time**:
-   ```
-   <ticket> | <Project Name>
-     Branch: <branch> — not found on remote
-     MR: https://gitlab.com/mycompany/repo/-/merge_requests/1234 — merged
-     Remove from WIP and log as completed? (y/n)
-   ```
-   Wait for the user's answer before proceeding to the next item.
-8. For confirmed removals: write a `[COMPLETED]` entry to the work log, remove from `wip.md`.
-   For items the user wants to keep: leave unchanged.
+```bash
+wt discover [--days N]
+```
 
-**Rules:**
-- Never auto-remove without asking. Every removal requires explicit confirmation.
+Finds MRs authored by the current user on GitLab that aren't tracked in WIP. Checks open MRs
+and MRs merged within the last N days (default 14). Returns JSON with untracked MRs including
+title, URL, branch, repo, state, and age.
+
+Present findings as a numbered list and ask which to add:
+
+```
+Found 2 untracked MRs:
+  1. "Fix OAuth token refresh" (!456, opened 3 days ago) — branch: fix/oauth-refresh
+  2. "Update CI pipeline" (!789, merged 2 days ago) — branch: ci-update
+Add any of these to WIP? (numbers, all, or skip)
+```
+
+For confirmed items: `wt add "<title>" --branch "<branch>" --repo "<repo>" --mr "<url>"`
+For merged items the user wants to log but not track: run `wt add` then immediately `wt done`.
+If empty: `[work-tracker] No untracked MRs found.`
+
+This checks all git-tracked items against their remotes and returns JSON with classifications:
+`merged`, `closed`, `active`, or `unknown`.
+
+Present findings **one item at a time**:
+
+```
+XP-1234 | Auth Service Rewrite
+  Branch: feature/oauth2 — not found on remote
+  MR: .../merge_requests/123 — merged
+  Remove from WIP and log as completed? (y/n)
+```
+
+Wait for the user's answer before proceeding to the next item.
+
+- For confirmed removals: `wt done "<item-id>" "<summary>"`
+- For items the user wants to keep: leave unchanged.
+- Never auto-remove. Every removal requires explicit confirmation.
 - If all items are active: `[work-tracker] Cleanup: all N items still active`
 - When done: `[work-tracker] Cleanup: removed N items, M remain`
 
@@ -381,32 +298,27 @@ Projects are identified by name, established when the user first answers "what p
 and persisted in `wip.md` and `config.md`.
 
 - Multiple tickets and repos can map to the same project.
-- `config.md` stores persistent aliases and settings (create the file when the first alias is established):
+- `config.md` stores persistent aliases and settings:
 
 ```markdown
 ## GitLab Settings
 gitlab-group: heb-engineering/projects/native-apps/ios
 
 ## Project Aliases
-# XYZ-1234, XYZ-1235, XYZ-1240, auth-service/*  ->  Auth Service Rewrite
-# XYZ-1301, XYZ-1315, backend/feature/api-*    ->  API Platform v2
+# XYZ-1234, XYZ-1235, auth-service/*  ->  Auth Service Rewrite
 ```
 
-- When a new ticket or branch is associated with a project, add it to config.md for automatic
-  future matching.
+- When a new ticket or branch is associated with a project, add it to config.md.
 - When ACLI is available, look up the parent epic to suggest groupings
   (see `references/acli-integration.md`).
 
 ## Edge Cases
 
-### Branch Switching Without New Conversation
+**Branch switching mid-conversation:** If the user switches branches or a git command reveals a
+different branch, re-run `wt context` and re-match.
 
-If the user switches branches mid-conversation, the skill won't automatically detect this.
-If the user mentions it or a git command reveals a different branch, re-run the matching logic.
-
-### Multiple Worktrees, Same Project
-
-Track them all under the same WIP item. The entry should reflect the most recently active worktree.
+**Multiple worktrees, same project:** Track under the same WIP item. Update with:
+`wt update <id> --worktree "<most recently active path>"`
 
 ## ACLI Integration (Optional)
 
@@ -417,3 +329,24 @@ ACLI is entirely optional — if commands fail, silently fall back to manual mod
 - Auto-populated ticket titles and status from JIRA
 - Parent epic lookup for automatic project grouping
 - Confluence page title lookup by page ID
+
+## wt Command Reference
+
+```
+wt init                          Ensure data directory and files exist
+wt context                       Detect git context, match against WIP (JSON)
+wt status [--json]               Display WIP dashboard (pretty or JSON)
+wt log <id> "<msg>"              Append entry to work log, bump last_touched
+wt update <id> [--status/--mr/--branch/--worktree/--repo ".."]
+                                 Update WIP item fields
+wt add "<name>" [--ticket/--repo/--branch/--worktree/--type/--status/--mr ".."]
+                                 Add new WIP item
+wt done <id> "<summary>"         Mark completed: log [COMPLETED], remove from WIP
+wt cleanup                       Check remote status of git items (JSON)
+wt discover [--days N]           Find authored MRs not tracked in WIP (JSON)
+wt reviews                       Pending MR reviews from GitLab (JSON)
+wt summary [year]                Gather work log data grouped by project (JSON)
+```
+
+Item `<id>` can be: ticket number (`XP-5210`), project slug (`peek-testing-skill`),
+project name substring (`Peek`), or 1-based index (`1`).

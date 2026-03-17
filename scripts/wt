@@ -1,0 +1,1035 @@
+#!/opt/homebrew/bin/python3
+"""wt - Work Tracker CLI.
+
+Handles all deterministic file operations for the work-tracker agent skill:
+git context detection, WIP matching, markdown parsing/writing, log appending,
+and remote status checks. The LLM skill calls this tool instead of doing
+file manipulation directly.
+
+All data lives in ~/.config/work-log/.
+"""
+
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+DATA_DIR = Path.home() / ".config" / "work-log"
+WIP_FILE = DATA_DIR / "wip.md"
+CONFIG_FILE = DATA_DIR / "config.md"
+ARCHIVE_DIR = DATA_DIR / "archive"
+
+
+def work_log_file(year=None):
+    if year is None:
+        year = datetime.date.today().year
+    return DATA_DIR / f"{year}-work-log.md"
+
+
+# ---------------------------------------------------------------------------
+# Markdown parsing for wip.md
+# ---------------------------------------------------------------------------
+
+class WipItem:
+    __slots__ = (
+        "ticket", "project", "repo", "branch", "worktree",
+        "mr", "status", "item_type", "started", "last_touched",
+    )
+
+    def __init__(self):
+        self.ticket = None
+        self.project = ""
+        self.repo = None
+        self.branch = None
+        self.worktree = None
+        self.mr = None
+        self.status = None
+        self.item_type = None
+        self.started = None
+        self.last_touched = None
+
+    @property
+    def item_id(self):
+        if self.ticket:
+            return self.ticket
+        return re.sub(r"[^a-z0-9]+", "-", self.project.lower()).strip("-")
+
+    def to_dict(self):
+        today = datetime.date.today()
+        stale_days = None
+        if self.last_touched:
+            try:
+                lt = datetime.datetime.strptime(self.last_touched, "%Y-%m-%d").date()
+                delta = (today - lt).days
+                if delta >= 30:
+                    stale_days = delta
+            except ValueError:
+                pass
+        return {
+            "item_id": self.item_id,
+            "ticket": self.ticket,
+            "project": self.project,
+            "repo": self.repo,
+            "branch": self.branch,
+            "worktree": self.worktree,
+            "mr": self.mr,
+            "status": self.status,
+            "type": self.item_type,
+            "started": self.started,
+            "last_touched": self.last_touched,
+            "stale_days": stale_days,
+        }
+
+    def to_markdown(self):
+        ticket_part = self.ticket if self.ticket else "<no ticket>"
+        lines = [f"## {ticket_part} | {self.project}"]
+        if self.repo:
+            lines.append(f"- **Repo:** {self.repo}")
+        if self.branch:
+            lines.append(f"- **Branch:** {self.branch}")
+        if self.worktree:
+            lines.append(f"- **Worktree:** {self.worktree}")
+        if self.mr:
+            lines.append(f"- **MR:** {self.mr}")
+        if self.item_type:
+            lines.append(f"- **Type:** {self.item_type}")
+        if self.status:
+            lines.append(f"- **Status:** {self.status}")
+        if self.started:
+            lines.append(f"- **Started:** {self.started}")
+        if self.last_touched:
+            lines.append(f"- **Last touched:** {self.last_touched}")
+        return "\n".join(lines)
+
+
+def parse_wip(content):
+    """Parse wip.md content into a list of WipItems."""
+    items = []
+    current = None
+
+    for line in content.split("\n"):
+        header = re.match(r"^## (.+?) \| (.+)$", line)
+        if header:
+            if current:
+                items.append(current)
+            current = WipItem()
+            ticket_part = header.group(1).strip()
+            current.project = header.group(2).strip()
+            if ticket_part != "<no ticket>":
+                current.ticket = ticket_part
+            continue
+
+        if current:
+            field = re.match(r"^- \*\*(.+?):\*\* (.+)$", line)
+            if field:
+                key = field.group(1).lower()
+                val = field.group(2).strip()
+                if key == "repo":
+                    current.repo = val
+                elif key == "branch":
+                    current.branch = val
+                elif key == "worktree":
+                    current.worktree = val
+                elif key == "mr":
+                    current.mr = val
+                elif key == "status":
+                    current.status = val
+                elif key == "type":
+                    current.item_type = val
+                elif key == "started":
+                    current.started = val
+                elif key == "last touched":
+                    current.last_touched = val
+
+    if current:
+        items.append(current)
+    return items
+
+
+def serialize_wip(items):
+    parts = ["# Work In Progress"]
+    for item in items:
+        parts.append("")
+        parts.append(item.to_markdown())
+    parts.append("")
+    return "\n".join(parts)
+
+
+def find_item(items, identifier):
+    """Find a WIP item by ticket, slug, project-name substring, or 1-based index."""
+    # Exact ticket
+    for item in items:
+        if item.ticket and item.ticket.upper() == identifier.upper():
+            return item
+    # Exact item_id (slug)
+    for item in items:
+        if item.item_id.lower() == identifier.lower():
+            return item
+    # Project name substring
+    for item in items:
+        if identifier.lower() in item.project.lower():
+            return item
+    # Numeric index
+    try:
+        idx = int(identifier) - 1
+        if 0 <= idx < len(items):
+            return items[idx]
+    except ValueError:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# File I/O with locking
+# ---------------------------------------------------------------------------
+
+def read_file(path):
+    try:
+        return Path(path).read_text()
+    except FileNotFoundError:
+        return None
+
+
+def write_file_locked(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.write(content)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+def git(*args, cwd=None):
+    """Run a git command, return stdout or None on failure."""
+    try:
+        r = subprocess.run(
+            ["git"] + list(args),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=cwd, timeout=10,
+        )
+        return r.stdout.strip() if r.returncode == 0 else None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def detect_git_context():
+    repo_root = git("rev-parse", "--show-toplevel")
+    if not repo_root:
+        return None
+
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    common_dir = git("rev-parse", "--git-common-dir")
+    cwd = os.getcwd()
+
+    is_worktree = False
+    worktree_path = None
+    if common_dir and common_dir not in (".git",):
+        real_common = os.path.realpath(
+            common_dir if os.path.isabs(common_dir) else os.path.join(repo_root, common_dir)
+        )
+        real_git = os.path.realpath(os.path.join(repo_root, ".git"))
+        if real_common != real_git:
+            is_worktree = True
+            worktree_path = cwd
+
+    remote_url = git("remote", "get-url", "origin")
+    repo_name = os.path.basename(repo_root)
+
+    repo_path = None
+    if remote_url:
+        m = re.match(r"git@[^:]+:(.+?)(?:\.git)?$", remote_url)
+        if m:
+            repo_path = m.group(1)
+        m = re.match(r"https?://[^/]+/(.+?)(?:\.git)?$", remote_url)
+        if m:
+            repo_path = m.group(1)
+
+    ticket = None
+    if branch:
+        m = re.search(r"([A-Z]+-\d+)", branch)
+        if m:
+            ticket = m.group(1)
+
+    return {
+        "repo_root": repo_root,
+        "repo_name": repo_name,
+        "repo_path": repo_path,
+        "remote_url": remote_url,
+        "branch": branch,
+        "is_worktree": is_worktree,
+        "worktree_path": worktree_path,
+        "ticket": ticket,
+    }
+
+
+def match_context_to_wip(ctx, items):
+    branch = ctx["branch"]
+    repo_path = ctx["repo_path"]
+    repo_name = ctx["repo_name"]
+    ticket = ctx["ticket"]
+
+    # Match by ticket
+    if ticket:
+        for item in items:
+            if item.ticket and item.ticket.upper() == ticket.upper():
+                return {
+                    "found": True,
+                    "item_id": item.item_id,
+                    "project": item.project,
+                    "status": item.status,
+                    "last_touched": item.last_touched,
+                }
+
+    # Match by branch
+    for item in items:
+        if not item.branch:
+            continue
+        item_branches = [b.strip() for b in item.branch.split(",")]
+        if branch in item_branches:
+            return {
+                "found": True,
+                "item_id": item.item_id,
+                "project": item.project,
+                "status": item.status,
+                "last_touched": item.last_touched,
+            }
+
+    # No match — is the repo at least known?
+    known_repo = False
+    for item in items:
+        if item.repo:
+            if (repo_path and repo_path in item.repo) or (repo_name and repo_name in item.repo):
+                known_repo = True
+                break
+
+    return {"found": False, "known_repo": known_repo, "new_branch": True}
+
+
+# ---------------------------------------------------------------------------
+# Work-log operations
+# ---------------------------------------------------------------------------
+
+def append_to_work_log(project, ticket, message, repo=None, branch=None, year=None):
+    today = datetime.date.today()
+    if year is None:
+        year = today.year
+    lf = work_log_file(year)
+    content = read_file(lf) or f"# {year} Work Log\n"
+
+    date_header = f"## {today.isoformat()}"
+    ticket_part = f"({ticket})" if ticket else "(<no ticket>)"
+    project_header = f"### {project} {ticket_part}"
+
+    # Ensure today's date section exists
+    if date_header not in content:
+        content = content.rstrip("\n") + f"\n\n{date_header}\n"
+
+    # Locate today's section boundaries
+    date_pos = content.index(date_header)
+    rest = content[date_pos + len(date_header):]
+    next_date = re.search(r"\n## \d{4}-\d{2}-\d{2}", rest)
+    section_end = (date_pos + len(date_header) + next_date.start()) if next_date else len(content)
+    section = content[date_pos:section_end]
+
+    if project_header in section:
+        # Append bullet to existing project subsection
+        proj_pos = date_pos + section.index(project_header)
+        after_proj = content[proj_pos + len(project_header):]
+        next_proj = re.search(r"\n### ", after_proj)
+        if next_proj:
+            insert_at = proj_pos + len(project_header) + next_proj.start()
+        else:
+            insert_at = section_end
+        content = content[:insert_at].rstrip("\n") + f"\n- {message}\n" + content[insert_at:].lstrip("\n")
+    else:
+        # New project subsection
+        lines = [project_header]
+        if repo and branch:
+            lines.append(f"- Repo: {repo}, branch: {branch}")
+        lines.append(f"- {message}")
+        block = "\n".join(lines)
+        content = content[:section_end].rstrip("\n") + f"\n\n{block}\n" + content[section_end:].lstrip("\n")
+
+    write_file_locked(lf, content)
+
+
+def complete_in_work_log(project, ticket, summary):
+    today = datetime.date.today()
+    lf = work_log_file(today.year)
+    content = read_file(lf) or f"# {today.year} Work Log\n"
+
+    date_header = f"## {today.isoformat()}"
+    ticket_part = f"({ticket})" if ticket else "(<no ticket>)"
+
+    if date_header not in content:
+        content = content.rstrip("\n") + f"\n\n{date_header}\n"
+
+    date_pos = content.index(date_header)
+    rest = content[date_pos + len(date_header):]
+    next_date = re.search(r"\n## \d{4}-\d{2}-\d{2}", rest)
+    section_end = (date_pos + len(date_header) + next_date.start()) if next_date else len(content)
+
+    entry = f"\n### {project} {ticket_part} [COMPLETED]\n- {summary}\n"
+    content = content[:section_end].rstrip("\n") + entry + content[section_end:]
+    write_file_locked(lf, content)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def parse_config():
+    content = read_file(CONFIG_FILE)
+    if not content:
+        return {}
+    cfg = {}
+    m = re.search(r"gitlab-group:\s*(.+)", content)
+    if m:
+        cfg["gitlab_group"] = m.group(1).strip()
+    return cfg
+
+
+def _parse_iso_datetime(s):
+    """Parse an ISO 8601 datetime string, handling fractional seconds and Z suffix."""
+    if not s or "T" not in s:
+        return None
+    try:
+        # Strip fractional seconds (.123, .123456, etc.) before timezone
+        cleaned = re.sub(r"\.\d+", "", s)
+        cleaned = cleaned.replace("Z", "+0000")
+        return datetime.datetime.strptime(cleaned, "%Y-%m-%dT%H:%M:%S%z")
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_init(_args):
+    created, existed = [], []
+
+    for d in (DATA_DIR, ARCHIVE_DIR):
+        dname = str(d.relative_to(DATA_DIR)) if d != DATA_DIR else "work-log/"
+        if not d.exists():
+            d.mkdir(parents=True, exist_ok=True)
+            created.append(dname)
+        else:
+            existed.append(dname)
+
+    if not WIP_FILE.exists():
+        write_file_locked(WIP_FILE, "# Work In Progress\n")
+        created.append("wip.md")
+    else:
+        existed.append("wip.md")
+
+    lf = work_log_file()
+    if not lf.exists():
+        year = datetime.date.today().year
+        write_file_locked(lf, f"# {year} Work Log\n")
+        created.append(lf.name)
+    else:
+        existed.append(lf.name)
+
+    return {"created": created, "existed": existed}
+
+
+def cmd_context(_args):
+    ctx = detect_git_context()
+    content = read_file(WIP_FILE) or "# Work In Progress\n"
+    items = parse_wip(content)
+
+    if ctx:
+        match = match_context_to_wip(ctx, items)
+        return {
+            "in_git_repo": True,
+            "repo": ctx["repo_path"] or ctx["repo_name"],
+            "repo_name": ctx["repo_name"],
+            "branch": ctx["branch"],
+            "is_worktree": ctx["is_worktree"],
+            "worktree_path": ctx["worktree_path"],
+            "ticket": ctx["ticket"],
+            "match": match,
+            "total_items": len(items),
+        }
+    return {"in_git_repo": False, "total_items": len(items)}
+
+
+def cmd_status(args):
+    content = read_file(WIP_FILE)
+    if not content:
+        if getattr(args, "json", False):
+            return {"items": [], "total": 0}
+        print("No WIP file found. Run `wt init` first.")
+        return None
+
+    items = parse_wip(content)
+
+    if getattr(args, "json", False):
+        return {"items": [i.to_dict() for i in items], "total": len(items)}
+
+    # Pretty output
+    if not items:
+        print("## Work In Progress\n\nNo active items.")
+        return None
+
+    print("## Work In Progress\n")
+    for item in items:
+        d = item.to_dict()
+        ticket_str = d["ticket"] or "no ticket"
+        print(f"{ticket_str} | {d['project']}")
+        if d["branch"]:
+            print(f"  Branch: {d['branch']}")
+        if d["worktree"]:
+            print(f"  Worktree: {d['worktree']}")
+        if d["mr"] and d["mr"] != "none":
+            print(f"  MR: {d['mr']}")
+        if d["type"]:
+            print(f"  Type: {d['type']}")
+        if d["status"]:
+            print(f"  Status: {d['status']}")
+        if d["stale_days"] is not None:
+            print(f"  (Last touched {d['stale_days']} days ago — run cleanup to check remote status)")
+        print()
+    return None
+
+
+def cmd_log(args):
+    content = read_file(WIP_FILE) or "# Work In Progress\n"
+    items = parse_wip(content)
+
+    item = find_item(items, args.item_id)
+    if not item:
+        return {"error": f"No WIP item matching '{args.item_id}'", "available": [i.item_id for i in items]}
+
+    append_to_work_log(
+        project=item.project,
+        ticket=item.ticket,
+        message=args.message,
+        repo=getattr(args, "repo", None) or item.repo,
+        branch=getattr(args, "branch", None) or item.branch,
+    )
+
+    item.last_touched = datetime.date.today().isoformat()
+    write_file_locked(WIP_FILE, serialize_wip(items))
+
+    return {
+        "logged": True,
+        "date": datetime.date.today().isoformat(),
+        "project": item.project,
+        "item_id": item.item_id,
+    }
+
+
+def cmd_update(args):
+    content = read_file(WIP_FILE) or "# Work In Progress\n"
+    items = parse_wip(content)
+
+    item = find_item(items, args.item_id)
+    if not item:
+        return {"error": f"No WIP item matching '{args.item_id}'", "available": [i.item_id for i in items]}
+
+    updated = []
+    if args.status is not None:
+        item.status = args.status
+        updated.append("status")
+    if args.mr is not None:
+        item.mr = args.mr
+        updated.append("mr")
+    if args.branch_name is not None:
+        item.branch = args.branch_name
+        updated.append("branch")
+    if args.worktree is not None:
+        item.worktree = args.worktree
+        updated.append("worktree")
+    if getattr(args, "repo", None) is not None:
+        item.repo = args.repo
+        updated.append("repo")
+
+    item.last_touched = datetime.date.today().isoformat()
+    updated.append("last_touched")
+
+    write_file_locked(WIP_FILE, serialize_wip(items))
+    return {"updated": True, "item_id": item.item_id, "fields": updated}
+
+
+def cmd_add(args):
+    content = read_file(WIP_FILE) or "# Work In Progress\n"
+    items = parse_wip(content)
+
+    item = WipItem()
+    item.project = args.name
+    item.ticket = getattr(args, "ticket", None)
+    item.repo = getattr(args, "repo", None)
+    item.branch = getattr(args, "branch", None)
+    item.worktree = getattr(args, "worktree", None)
+    item.item_type = getattr(args, "type", None)
+    item.status = getattr(args, "status", None) or "Just started."
+    item.mr = getattr(args, "mr", None)
+    item.started = datetime.date.today().isoformat()
+    item.last_touched = datetime.date.today().isoformat()
+
+    if item.repo and not item.mr:
+        item.mr = "none"
+
+    items.append(item)
+    write_file_locked(WIP_FILE, serialize_wip(items))
+    return {"added": True, "item_id": item.item_id, "project": item.project}
+
+
+def cmd_done(args):
+    content = read_file(WIP_FILE) or "# Work In Progress\n"
+    items = parse_wip(content)
+
+    item = find_item(items, args.item_id)
+    if not item:
+        return {"error": f"No WIP item matching '{args.item_id}'", "available": [i.item_id for i in items]}
+
+    complete_in_work_log(item.project, item.ticket, args.summary)
+    result = {"completed": True, "item_id": item.item_id, "project": item.project}
+
+    items = [i for i in items if i is not item]
+    write_file_locked(WIP_FILE, serialize_wip(items))
+    return result
+
+
+def cmd_cleanup(_args):
+    content = read_file(WIP_FILE) or "# Work In Progress\n"
+    items = parse_wip(content)
+    current_ctx = detect_git_context()
+
+    findings = []
+    skipped_non_git = 0
+
+    for item in items:
+        if not item.branch or not item.repo:
+            skipped_non_git += 1
+            continue
+
+        finding = {
+            "item_id": item.item_id,
+            "project": item.project,
+            "ticket": item.ticket,
+            "branch": item.branch,
+            "mr": item.mr,
+            "branch_status": "unknown",
+            "mr_status": "unknown",
+            "classification": "unknown",
+        }
+
+        # Determine working directory
+        work_dir = None
+        if item.worktree:
+            expanded = os.path.expanduser(item.worktree)
+            if os.path.isdir(expanded):
+                work_dir = expanded
+        if not work_dir and current_ctx:
+            if item.repo and (
+                (current_ctx["repo_path"] and current_ctx["repo_path"] in item.repo)
+                or (current_ctx["repo_name"] and current_ctx["repo_name"] in item.repo)
+            ):
+                work_dir = current_ctx["repo_root"]
+        if not work_dir:
+            findings.append(finding)
+            continue
+
+        git("fetch", "origin", cwd=work_dir)
+        primary_branch = item.branch.split(",")[0].strip()
+        ls = git("ls-remote", "--heads", "origin", primary_branch, cwd=work_dir)
+        finding["branch_status"] = "exists" if ls else "gone"
+
+        # Check MR/PR state
+        if item.mr and item.mr != "none":
+            mr_url = item.mr
+            if "merge_requests" in mr_url or mr_url.startswith("!"):
+                num = re.search(r"(\d+)$", mr_url)
+                if num:
+                    try:
+                        r = subprocess.run(
+                            ["glab", "mr", "view", num.group(1), "--output", "json"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, cwd=work_dir, timeout=15,
+                        )
+                        if r.returncode == 0:
+                            finding["mr_status"] = json.loads(r.stdout).get("state", "unknown")
+                    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+                        pass
+            elif "pull" in mr_url or mr_url.startswith("#"):
+                num = re.search(r"(\d+)$", mr_url)
+                if num:
+                    try:
+                        r = subprocess.run(
+                            ["gh", "pr", "view", num.group(1), "--json", "state"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, cwd=work_dir, timeout=15,
+                        )
+                        if r.returncode == 0:
+                            finding["mr_status"] = json.loads(r.stdout).get("state", "unknown").lower()
+                    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+                        pass
+
+        # Classify
+        if finding["mr_status"] == "merged" or (
+            finding["branch_status"] == "gone" and finding["mr_status"] in ("unknown", "merged")
+        ):
+            finding["classification"] = "merged"
+        elif finding["mr_status"] == "closed":
+            finding["classification"] = "closed"
+        elif finding["branch_status"] == "exists":
+            finding["classification"] = "active"
+
+        findings.append(finding)
+
+    return {"findings": findings, "skipped_non_git": skipped_non_git}
+
+
+def cmd_discover(args):
+    """Find MRs authored by the current user that aren't tracked in WIP."""
+    cfg = parse_config()
+    group = cfg.get("gitlab_group")
+    if not group:
+        return {"untracked": [], "note": "No gitlab-group configured in config.md"}
+
+    content = read_file(WIP_FILE) or "# Work In Progress\n"
+    items = parse_wip(content)
+
+    # Collect known MR URLs and branches for matching
+    known_mr_urls = set()
+    known_branches = set()
+    for item in items:
+        if item.mr and item.mr != "none":
+            known_mr_urls.add(item.mr.rstrip("/"))
+            # Also extract MR number for fuzzy matching
+            num = re.search(r"(\d+)$", item.mr)
+            if num:
+                known_mr_urls.add(num.group(1))
+        if item.branch:
+            for b in item.branch.split(","):
+                known_branches.add(b.strip())
+
+    # Determine how many days back to look for merged MRs
+    merged_days = getattr(args, "days", None) or 14
+
+    # Fetch open MRs authored by current user
+    all_mrs = []
+    for state_flag in ([], ["--merged"]):
+        try:
+            cmd = [
+                "glab", "mr", "list",
+                "--author=@me",
+                f"--group={group}",
+                "--output=json",
+                "--per-page=50",
+            ] + state_flag
+            r = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=30,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                mrs = json.loads(r.stdout)
+                if isinstance(mrs, list):
+                    query_state = "merged" if state_flag else "opened"
+                    for mr in mrs:
+                        mr["_query_state"] = query_state
+                    all_mrs.extend(mrs)
+        except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    if not all_mrs:
+        return {"untracked": [], "checked": 0, "note": "No MRs found or glab failed"}
+
+    # Filter merged MRs to only recent ones
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now - datetime.timedelta(days=merged_days)
+
+    untracked = []
+    checked = 0
+
+    for mr in all_mrs:
+        checked += 1
+        web_url = mr.get("web_url", "").rstrip("/")
+        source_branch = mr.get("source_branch", "")
+        state = mr.get("state", mr.get("_query_state", "unknown"))
+        mr_iid = str(mr.get("iid", ""))
+
+        # Skip merged MRs older than cutoff or with no merge date
+        if state == "merged":
+            merged_at = mr.get("merged_at", "")
+            if not merged_at:
+                # No merge timestamp — fall back to updated_at
+                merged_at = mr.get("updated_at", "")
+            merged_dt = _parse_iso_datetime(merged_at)
+            if merged_dt:
+                if merged_dt < cutoff:
+                    continue
+            else:
+                # No parseable date — skip it
+                continue
+
+        # Check if already tracked
+        tracked = False
+        if web_url and web_url in known_mr_urls:
+            tracked = True
+        if mr_iid and mr_iid in known_mr_urls:
+            tracked = True
+        if source_branch and source_branch in known_branches:
+            tracked = True
+        # Also check if the MR URL is a substring of any known URL or vice versa
+        if not tracked and web_url:
+            for known in known_mr_urls:
+                if known in web_url or web_url in known:
+                    tracked = True
+                    break
+
+        if tracked:
+            continue
+
+        # Extract repo path from web_url
+        repo_path = None
+        if web_url:
+            m = re.match(r"https?://[^/]+/(.+?)/-/merge_requests/\d+", web_url)
+            if m:
+                repo_path = m.group(1)
+
+        # Compute age
+        age = ""
+        created_at = mr.get("created_at", "")
+        created = _parse_iso_datetime(created_at)
+        if created:
+            delta = now - created
+            secs = delta.total_seconds()
+            if secs < 3600:
+                age = f"{int(secs / 60)} minutes ago"
+            elif secs < 86400:
+                age = f"{int(secs / 3600)} hours ago"
+            else:
+                age = f"{delta.days} days ago"
+
+        untracked.append({
+            "title": mr.get("title", ""),
+            "url": web_url,
+            "iid": mr_iid,
+            "source_branch": source_branch,
+            "state": state,
+            "repo": repo_path,
+            "created": age,
+            "labels": mr.get("labels", []),
+            "description": (mr.get("description", "") or "")[:300],
+        })
+
+    return {
+        "untracked": untracked,
+        "checked": checked,
+        "merged_lookback_days": merged_days,
+    }
+
+
+def cmd_reviews(_args):
+    cfg = parse_config()
+    group = cfg.get("gitlab_group")
+    if not group:
+        return {"reviews": [], "note": "No gitlab-group configured in config.md"}
+
+    try:
+        r = subprocess.run(
+            ["glab", "mr", "list", "--reviewer=@me", f"--group={group}", "--output=json"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return {"reviews": [], "note": "glab command failed"}
+
+        mrs = json.loads(r.stdout)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        reviews = []
+        for mr in mrs:
+            age = ""
+            ca = mr.get("created_at", "")
+            created = _parse_iso_datetime(ca)
+            if created:
+                delta = now - created
+                secs = delta.total_seconds()
+                if secs < 3600:
+                    age = f"{int(secs / 60)} minutes ago"
+                elif secs < 86400:
+                    age = f"{int(secs / 3600)} hours ago"
+                else:
+                    age = f"{delta.days} days ago"
+            reviews.append({
+                "title": mr.get("title", ""),
+                "url": mr.get("web_url", ""),
+                "opened": age,
+            })
+        return {"reviews": reviews}
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        return {"reviews": [], "note": "glab not available or failed"}
+
+
+def cmd_summary(args):
+    year = args.year or datetime.date.today().year
+    lf = work_log_file(year)
+    content = read_file(lf)
+    if not content:
+        return {"error": f"No work log found for {year}"}
+
+    projects = {}
+    cur_date = None
+    cur_proj = None
+
+    for line in content.split("\n"):
+        dm = re.match(r"^## (\d{4}-\d{2}-\d{2})$", line)
+        if dm:
+            cur_date = dm.group(1)
+            cur_proj = None
+            continue
+
+        pm = re.match(r"^### (.+?)(?:\s+\(([^)]*)\))?\s*(\[COMPLETED\])?\s*$", line)
+        if pm:
+            cur_proj = pm.group(1).strip()
+            raw_ticket = pm.group(2)
+            ticket = raw_ticket if raw_ticket and raw_ticket != "<no ticket>" else None
+            completed = pm.group(3) is not None
+
+            if cur_proj not in projects:
+                projects[cur_proj] = {
+                    "project": cur_proj,
+                    "tickets": set(),
+                    "repos": set(),
+                    "dates": [],
+                    "entries": [],
+                    "completed": False,
+                }
+            if ticket:
+                projects[cur_proj]["tickets"].add(ticket)
+            if cur_date:
+                projects[cur_proj]["dates"].append(cur_date)
+            if completed:
+                projects[cur_proj]["completed"] = True
+            continue
+
+        bm = re.match(r"^- (.+)$", line)
+        if bm and cur_proj and cur_proj in projects:
+            text = bm.group(1)
+            rm = re.match(r"Repo:\s*([^,]+)", text)
+            if rm:
+                projects[cur_proj]["repos"].add(rm.group(1).strip())
+            projects[cur_proj]["entries"].append({"date": cur_date, "text": text})
+
+    result = []
+    for proj in projects.values():
+        dates = sorted(proj["dates"])
+        result.append({
+            "project": proj["project"],
+            "tickets": sorted(proj["tickets"]),
+            "repos": sorted(proj["repos"]),
+            "first_date": dates[0] if dates else None,
+            "last_date": dates[-1] if dates else None,
+            "entry_count": len(proj["entries"]),
+            "entries": proj["entries"],
+            "completed": proj["completed"],
+        })
+
+    return {
+        "year": year,
+        "projects": result,
+        "total_projects": len(result),
+        "total_entries": sum(p["entry_count"] for p in result),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="wt", description="Work Tracker CLI")
+    sub = p.add_subparsers(dest="command")
+    sub.required = True  # compat with 3.6
+
+    sub.add_parser("init", help="Ensure data directory and files exist")
+    sub.add_parser("context", help="Detect git context and match against WIP")
+
+    sp = sub.add_parser("status", help="Display WIP dashboard")
+    sp.add_argument("--json", action="store_true", help="Output as JSON")
+
+    sp = sub.add_parser("log", help="Append entry to work log")
+    sp.add_argument("item_id", help="WIP item identifier (ticket, slug, or index)")
+    sp.add_argument("message", help="Log message")
+    sp.add_argument("--repo", help="Override repo for first-of-day entry")
+    sp.add_argument("--branch", help="Override branch for first-of-day entry")
+
+    sp = sub.add_parser("update", help="Update WIP item fields")
+    sp.add_argument("item_id", help="WIP item identifier")
+    sp.add_argument("--status", help="New status text")
+    sp.add_argument("--mr", help="MR/PR URL")
+    sp.add_argument("--branch", dest="branch_name", help="Branch name")
+    sp.add_argument("--worktree", help="Worktree path")
+    sp.add_argument("--repo", help="Repo path")
+
+    sp = sub.add_parser("add", help="Add a new WIP item")
+    sp.add_argument("name", help="Project name")
+    sp.add_argument("--ticket", help="Ticket number (e.g. XP-1234)")
+    sp.add_argument("--repo", help="Repo path")
+    sp.add_argument("--branch", help="Branch name")
+    sp.add_argument("--worktree", help="Worktree path")
+    sp.add_argument("--type", help="Work type for non-code items")
+    sp.add_argument("--status", help="Initial status")
+    sp.add_argument("--mr", help="MR/PR URL")
+
+    sp = sub.add_parser("done", help="Mark a WIP item as completed")
+    sp.add_argument("item_id", help="WIP item identifier")
+    sp.add_argument("summary", help="Completion summary for the work log")
+
+    sub.add_parser("cleanup", help="Check remote status of all git-tracked WIP items")
+
+    sp = sub.add_parser("discover", help="Find authored MRs not tracked in WIP")
+    sp.add_argument("--days", type=int, default=14, help="Look back N days for merged MRs (default: 14)")
+
+    sub.add_parser("reviews", help="Check pending MR reviews from GitLab")
+
+    sp = sub.add_parser("summary", help="Gather work log data for annual summary")
+    sp.add_argument("year", type=int, nargs="?", help="Year (default: current)")
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    dispatch = {
+        "init": cmd_init,
+        "context": cmd_context,
+        "status": cmd_status,
+        "log": cmd_log,
+        "update": cmd_update,
+        "add": cmd_add,
+        "done": cmd_done,
+        "cleanup": cmd_cleanup,
+        "discover": cmd_discover,
+        "reviews": cmd_reviews,
+        "summary": cmd_summary,
+    }
+
+    try:
+        result = dispatch[args.command](args)
+        if result is not None:
+            print(json.dumps(result, indent=2))
+    except Exception as e:
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
